@@ -93,7 +93,7 @@ mod squarings {
         use super::*;
         use crate::ark_groth16::{generate_random_parameters, prepare_verifying_key, verify_proof};
         use crate::groth::prover::create_random_proof;
-        use ark_ff::One;
+        use ark_ff::{One, PrimeField};
 
         pub struct Groth16Bench;
 
@@ -176,6 +176,7 @@ mod squarings {
                 match result {
                     Ok(is_ok) => {
                         println!("Verify result: {}", is_ok);
+                        println!("total is {}", public_inputs[0].into_repr().as_ref()[0]);
                         assert!(is_ok);
                     },
                     Err(e) => {
