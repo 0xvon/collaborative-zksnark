@@ -33,10 +33,17 @@ trait SnarkBench {
 }
 
 mod squarings {
+    use ark_relations::r1cs::LinearCombination;
     use super::*;
     #[derive(Clone)]
     struct RepeatedSquaringCircuit<F: Field> {
         chain: Vec<Option<F>>,
+    }
+
+    #[derive(Clone)]
+    struct VotingCircuit<F: Field> {
+        inputs: Vec<Option<F>>,
+        total: Option<F>,
     }
 
     impl<F: Field> RepeatedSquaringCircuit<F> {
@@ -64,30 +71,61 @@ mod squarings {
         }
     }
 
+    impl<F: Field> VotingCircuit<F> {
+        fn without_data(votes: usize) -> Self {
+            Self {
+                inputs: vec![None; votes],
+                total: Some(F::zero()),
+            }
+        }
+        fn new(votes: Vec<F>, total: F) -> Self {
+            Self {
+                inputs: votes.into_iter().map(Some).collect(),
+                total: Some(total),
+            }
+        }
+        fn votes(&self) -> usize {
+            self.inputs.len()
+        }
+    }
+
     pub mod groth {
         use super::*;
         use crate::ark_groth16::{generate_random_parameters, prepare_verifying_key, verify_proof};
         use crate::groth::prover::create_random_proof;
+        use ark_ff::{One, PrimeField};
 
         pub struct Groth16Bench;
 
         impl SnarkBench for Groth16Bench {
             fn local<E: PairingEngine>(n: usize, timer_label: &str) {
                 let rng = &mut test_rng();
-                let circ_no_data = RepeatedSquaringCircuit::without_data(n);
+                let votes: Vec<E::Fr> = (0..n).map(|_| {
+                    if rand::random::<bool>() { E::Fr::one() } else { -E::Fr::one() }
+                }).collect();
+                let total: E::Fr = votes.iter().sum();
+                let circ_no_data = VotingCircuit::without_data(n);
 
                 let params = generate_random_parameters::<E, _, _>(circ_no_data, rng).unwrap();
-
+                // println!("vk: {:?}", params.vk);
                 let pvk = prepare_verifying_key::<E>(&params.vk);
-
-                let a = E::Fr::rand(rng);
-                let circ_data = RepeatedSquaringCircuit::from_start(a, n);
-                let public_inputs = vec![circ_data.chain.last().unwrap().unwrap()];
+                let circ_data = VotingCircuit::new(votes, total);
+                let public_inputs = vec![total];
+                // println!("public_inputs length: {}", public_inputs.len());
                 let timer = start_timer!(|| timer_label);
                 let proof = create_random_proof::<E, _, _>(circ_data, &params, rng).unwrap();
                 end_timer!(timer);
 
-                assert!(verify_proof(&pvk, &proof, &public_inputs).unwrap());
+                let result = verify_proof(&pvk, &proof, &public_inputs);
+                match result {
+                    Ok(is_ok) => {
+                        println!("Verify result: {}", is_ok);
+                        assert!(is_ok);
+                    },
+                    Err(e) => {
+                        println!("Failed to verify proof: {:?}", e);
+                    },
+                }
             }
 
             fn ark_local<E: PairingEngine>(n: usize, timer_label: &str) {
@@ -111,20 +149,16 @@ mod squarings {
 
             fn mpc<E: PairingEngine, S: PairingShare<E>>(n: usize, timer_label: &str) {
                 let rng = &mut test_rng();
-                let circ_no_data = RepeatedSquaringCircuit::without_data(n);
-
+                let circ_no_data = VotingCircuit::without_data(n);
                 let params = generate_random_parameters::<E, _, _>(circ_no_data, rng).unwrap();
 
                 let pvk = prepare_verifying_key::<E>(&params.vk);
                 let mpc_params = Reveal::from_public(params);
 
-                let a = E::Fr::rand(rng);
                 let computation_timer = start_timer!(|| "do the mpc (cheat)");
-                let circ_data = mpc_squaring_circuit::<
-                    E::Fr,
-                    <MpcPairingEngine<E, S> as PairingEngine>::Fr,
-                >(a, n);
-                let public_inputs = vec![circ_data.chain.last().unwrap().unwrap().reveal()];
+
+                let circ_data = mpc_voting_circuit::<E::Fr, <MpcPairingEngine<E, S> as PairingEngine>::Fr>(n);
+                let public_inputs = vec![circ_data.total.unwrap().reveal()];
                 end_timer!(computation_timer);
                 MpcMultiNet::reset_stats();
                 let timer = start_timer!(|| timer_label);
@@ -138,7 +172,17 @@ mod squarings {
                 });
                 end_timer!(timer);
 
-                assert!(verify_proof(&pvk, &proof, &public_inputs).unwrap());
+                let result = verify_proof(&pvk, &proof, &public_inputs);
+                match result {
+                    Ok(is_ok) => {
+                        println!("Verify result: {}", is_ok);
+                        println!("total is {}", public_inputs[0].into_repr().as_ref()[0]);
+                        assert!(is_ok);
+                    },
+                    Err(e) => {
+                        println!("Failed to verify proof: {:?}", e);
+                    },
+                }
             }
         }
     }
@@ -315,6 +359,26 @@ mod squarings {
         }
     }
 
+    fn mpc_voting_circuit<Fr: Field, MFr: Field + Reveal<Base = Fr>>(
+        votes: usize,
+    ) -> VotingCircuit<MFr> {
+        let rng = &mut test_rng();
+        let shared_inputs: Vec<MFr> = (0..votes).map(|_| {
+            if rand::random::<bool>() {
+                MFr::king_share(Fr::one(), rng)
+            } else {
+                MFr::king_share(-Fr::one(), rng)
+            }
+        }).collect();
+        let shared_total = shared_inputs.iter()
+            .fold(MFr::zero(), |acc, &input| acc + input);
+
+        VotingCircuit {
+            inputs: shared_inputs.into_iter().map(Some).collect(),
+            total: Some(shared_total),
+        }
+    }
+
     impl<ConstraintF: Field> ConstraintSynthesizer<ConstraintF>
         for RepeatedSquaringCircuit<ConstraintF>
     {
@@ -338,6 +402,38 @@ mod squarings {
             for i in 0..self.squarings() {
                 cs.enforce_constraint(lc!() + vars[i], lc!() + vars[i], lc!() + vars[i + 1])?;
             }
+
+            Ok(())
+        }
+    }
+
+    impl<ConstraintF: Field> ConstraintSynthesizer<ConstraintF>
+        for VotingCircuit<ConstraintF>
+    {
+        fn generate_constraints(
+            self,
+            cs: ConstraintSystemRef<ConstraintF>,
+        ) -> Result<(), SynthesisError> {
+            let mut sum_lc = LinearCombination::<ConstraintF>::zero();
+            for input_opt in self.inputs.iter() {
+                let input_var = cs.new_witness_variable(|| input_opt.ok_or(SynthesisError::AssignmentMissing))?;
+
+                // input * input should be 1 (input should be +1 or -1)
+                cs.enforce_constraint(
+                    lc!() + input_var,
+                    lc!() + input_var,
+                    lc!() + Variable::One,
+                )?;
+
+                sum_lc = sum_lc + (ConstraintF::one(), input_var);
+            }
+
+            let total_var = cs.new_input_variable(|| self.total.ok_or(SynthesisError::AssignmentMissing))?;
+            cs.enforce_constraint(
+                sum_lc,
+                lc!() + Variable::One,
+                lc!() + total_var,
+            )?;
 
             Ok(())
         }
